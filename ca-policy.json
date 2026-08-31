@@ -1,27 +1,27 @@
 {
   "policy": {
-    "issuerParameters": {
-      "name": "Self"
-    },
-    "keyProperties": {
+    "key_props": {
       "exportable": false,
-      "keyType": "RSA",
-      "keySize": 4096,
-      "reuseKey": false
+      "kty": "RSA",
+      "key_size": 4096,
+      "reuse_key": false
     },
-    "secretProperties": {
+    "secret_props": {
       "contentType": "application/x-pem-file"
     },
-    "x509CertificateProperties": {
+    "x509_props": {
       "subject": "CN=MyOrg Root CA",
-      "keyUsage": [
+      "key_usage": [
         "keyCertSign",
         "cRLSign"
       ],
       "basic_constraints": {
         "ca": true
       },
-      "validityInMonths": 120
+      "validity_months": 120
+    },
+    "issuer": {
+      "name": "Self"
     }
   }
 }
