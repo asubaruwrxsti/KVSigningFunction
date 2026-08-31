@@ -128,16 +128,21 @@ Caddy trusts the Root CA's public certificate for mTLS validation.
 - All builds must be run with `--platform linux/amd64` explicitly when building on Apple Silicon hardware, since the Function App plan runs amd64.
 - Route note: the Functions host forwards the **full path** (e.g. `/api/issue`, matching the route defined in `function.json`) to the custom handler process — the Go router must register at that full path, not just the route's suffix.
 
-### 6.3 CA certificate bootstrap — the unresolved edge case
+### 6.3 CA certificate bootstrap — resolved
+
 Two approaches were evaluated for creating the self-signed root CA certificate itself:
 
 1. **`az keyvault certificate create`** (CLI-native): generates a key + self-signed cert together inside Key Vault. **Confirmed broken for this use case** — Azure Key Vault's certificate creation always produces `Basic Constraints: CA:FALSE`, regardless of policy JSON input, because the CLI/SDK layer does not expose a way to set `CA:TRUE`. This is a documented, known Azure limitation (tracked in public Azure CLI/REST API spec GitHub issues), not a configuration error. A cert with `CA:FALSE` cannot validly sign other certificates and will fail `openssl verify` with error 79 (`invalid CA certificate`).
 
-2. **Direct `az rest` call to the Key Vault REST API** with an undocumented `basic_constraints: { "ca": true }` field inside `x509_props` (note: REST API `7.4` uses **snake_case** field names — `key_props`, `secret_props`, `x509_props` — not the camelCase used in older blog examples). This is unofficial/undocumented behavior reported to work by at least one external bug report, but is **not guaranteed by Microsoft** and was still being validated at the time of writing.
+2. **Direct `az rest` call to the Key Vault REST API** with an undocumented `basic_constraints: { "ca": true }` field inside `x509_props`. **Confirmed working.** Two schema details had to be corrected before it succeeded:
+   - REST API `7.4` uses **snake_case** field names (`key_props`, `secret_props`, `x509_props`), not the camelCase used in some older blog examples (`keyProperties`, `x509CertificateProperties`). Using the wrong casing causes the API to silently ignore the whole block, which surfaces as a confusing `"Either subjectName or san must be present"` error even though a subject was supplied.
+   - `basic_constraints` is not in Microsoft's officially documented schema, but is honored by the backend when nested correctly inside `x509_props` alongside the other snake_case fields.
 
-3. **Fallback (reliable): a one-off local Go script**, using the exact same `KeyVaultSigner`/`crypto.Signer` pattern as the Function itself, calling `x509.CreateCertificate()` locally with `IsCA: true` and `BasicConstraintsValid: true`, signing against the *existing* Key Vault-held key (so the private key still never leaves Key Vault — only the self-signing orchestration happens locally). This is the recommended fallback if the REST/`basic_constraints` approach does not pan out, since it relies on documented, stable Go standard library behavior rather than an undocumented Key Vault field.
+   The resulting certificate was verified to have `X509v3 Basic Constraints: critical / CA:TRUE`, and downstream client certificates issued against it passed `openssl verify -CAfile ca-cert.pem client.crt` with `OK`. See §7.2 for the exact working request body.
 
-**Status at time of writing:** the `az rest` approach was being tested; a definitive resolution (REST field works vs. Go script fallback needed) was not yet confirmed.
+3. **Fallback (not needed, but documented for reference): a one-off local Go script**, using the exact same `KeyVaultSigner`/`crypto.Signer` pattern as the Function itself, calling `x509.CreateCertificate()` locally with `IsCA: true` and `BasicConstraintsValid: true`, signing against the *existing* Key Vault-held key. This remains the fallback if the undocumented REST field is ever changed/removed by Microsoft, since it relies on documented, stable Go standard library behavior instead.
+
+**Resolution:** Option 2 (`az rest` with corrected snake_case `basic_constraints`) is the method actually used going forward. The final CA certificate object is named `ca-root-cert` (superseding the earlier, broken `ca-signing-cert` created via the CLI-native path).
 
 ---
 
@@ -155,7 +160,70 @@ az keyvault key create \
 Requires `Key Vault Administrator` or `Key Vault Crypto Officer` role on the vault for the operator running this (RBAC-mode vaults reject this otherwise with `ForbiddenByRbac`).
 
 ### 7.2 Create the self-signed root CA certificate
-See §6.3 — either via `az rest` with a corrected snake_case `basic_constraints` policy body, or via the one-off Go bootstrap script signing against `ca-signing-key`. Output: `ca-cert.pem`.
+
+Write the certificate policy with the corrected snake_case schema, including the undocumented `basic_constraints` field (see §6.3):
+
+```bash
+cat > ca-policy.json << 'EOF'
+{
+  "policy": {
+    "key_props": {
+      "exportable": false,
+      "kty": "RSA",
+      "key_size": 4096,
+      "reuse_key": false
+    },
+    "secret_props": {
+      "contentType": "application/x-pem-file"
+    },
+    "x509_props": {
+      "subject": "CN=MyOrg Root CA",
+      "key_usage": [
+        "keyCertSign",
+        "cRLSign"
+      ],
+      "basic_constraints": {
+        "ca": true
+      },
+      "validity_months": 120
+    },
+    "issuer": {
+      "name": "Self"
+    }
+  }
+}
+EOF
+```
+
+Call the Key Vault REST API directly via `az rest` (the `az keyvault certificate create` CLI wrapper does not pass `basic_constraints` through — see §6.3):
+
+```bash
+az rest \
+  --method post \
+  --url "https://pivotkv.vault.azure.net/certificates/ca-root-cert/create?api-version=7.4" \
+  --headers "Content-Type=application/json" \
+  --body @ca-policy.json \
+  --resource "https://vault.azure.net"
+```
+
+Confirm creation and download the public certificate:
+
+```bash
+az keyvault certificate show --vault-name PivotKV --name ca-root-cert --query "{id:id, x5t:x5t}"
+
+az keyvault certificate download \
+  --vault-name PivotKV \
+  --name ca-root-cert \
+  --file ca-cert.pem \
+  --encoding PEM
+```
+
+Verify the fix actually took effect:
+
+```bash
+openssl x509 -in ca-cert.pem -noout -text | grep -A2 "Basic Constraints"
+# Expect: X509v3 Basic Constraints: critical / CA:TRUE
+```
 
 ### 7.3 Store the CA public certificate as a Key Vault secret
 ```bash
@@ -235,10 +303,11 @@ az functionapp config appsettings set \
   --resource-group rg-prototype \
   --settings \
     KEY_VAULT_URL="https://pivotkv.vault.azure.net/" \
-    CA_KEY_NAME="ca-signing-key" \
+    CA_KEY_NAME="ca-root-cert" \
     TENANT_ID="<tenant-id>" \
     EXPECTED_AUDIENCE="<app registration audience>"
 ```
+Note: `CA_KEY_NAME` was initially set to `ca-signing-key` (the standalone key object from §7.1) and briefly to `ca-signing-cert` (the broken CLI-native certificate from the earlier, rejected approach in §6.3) during iteration. The final, correct value is `ca-root-cert` — the certificate object created via the working `az rest` method in §7.2.
 
 ### 7.9 Restart and verify
 ```bash
@@ -267,7 +336,158 @@ curl -i -X POST \
 openssl x509 -in client.crt -noout -text
 openssl verify -CAfile ca-cert.pem client.crt
 ```
-Confirmed working: correct issuer/subject, 7-day validity, `Digital Signature` key usage, `TLS Web Client Authentication` EKU, `CA:FALSE`, and chain validation returning `client.crt: OK` (once a correctly `CA:TRUE`-flagged root cert is in place — see §6.3 for the caveat on the root cert itself).
+Confirmed working: correct issuer/subject, 7-day validity, `Digital Signature` key usage, `TLS Web Client Authentication` EKU, `CA:FALSE`, and chain validation returning `client.crt: OK` against the corrected, properly-flagged `CA:TRUE` root cert (§7.2).
+
+### 7.12 Clean, from-scratch client issuance test (CSR only, no key returned)
+
+Clarifying note on the flow, since it's easy to misstate: the **client** generates its own keypair and CSR; the **Function** returns only a signed **certificate**, never a key. The private key never transits the network in either direction.
+
+```bash
+mkdir -p ~/mtls-test && cd ~/mtls-test
+
+# 1. Client generates its own keypair + CSR locally — private key never leaves this machine
+openssl req -new -newkey rsa:2048 -nodes \
+  -keyout client.key \
+  -out client.csr \
+  -subj "/CN=example-client"
+
+# 2. Authenticate to the Function
+TOKEN=$(az account get-access-token --resource https://management.azure.com --query accessToken -o tsv)
+
+# 3. Submit CSR, receive signed certificate (no key in the response)
+curl -s -X POST "https://generatemtlsv2.azurewebsites.net/api/issue" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-binary @client.csr \
+  -o client.crt
+
+# 4. Get the current root CA public cert for verification
+az keyvault certificate download \
+  --vault-name PivotKV --name ca-root-cert \
+  --file ca-cert.pem --encoding PEM
+
+# 5. Inspect and verify
+openssl x509 -in client.crt -noout -text
+openssl verify -CAfile ca-cert.pem client.crt
+
+# 6. Confirm the private key actually matches the issued cert
+openssl x509 -noout -modulus -in client.crt | openssl md5
+openssl rsa -noout -modulus -in client.key | openssl md5
+# both outputs must be identical
+```
+
+### 7.13 End-to-end test from inside a real App Service (managed identity flow)
+
+This validates the actual production flow — a client app authenticating with its own Managed Identity rather than an operator's CLI token.
+
+**a. Create a real Azure AD App Registration for the Function's audience** (replaces the `management.azure.com` stand-in used for CLI testing):
+
+```bash
+az ad app create --display-name "signing-function-api"
+# note the returned appId
+
+appId=<paste-appId-here>
+az ad app update --id $appId --identifier-uris "api://$appId"
+```
+Note: tenant policy on this subscription rejects arbitrary identifier URIs (e.g. `api://signing-function`) — the URI must embed the app's own ID or the tenant ID (`https://aka.ms/identifier-uri-formatting-error`).
+
+**b. Point the Function at the real audience:**
+
+```bash
+az functionapp config appsettings set \
+  --name GeneratemTLSv2 --resource-group rg-prototype \
+  --settings EXPECTED_AUDIENCE="api://$appId"
+
+az functionapp restart --name GeneratemTLSv2 --resource-group rg-prototype
+```
+
+**c. Enable Managed Identity on the client App Service and authorize it in policy:**
+
+```bash
+az webapp identity assign --name PivotAppService --resource-group rg-prototype
+
+appPrincipalId=$(az webapp identity show --name PivotAppService --resource-group rg-prototype --query principalId -o tsv)
+
+az functionapp config appsettings set \
+  --name GeneratemTLSv2 --resource-group rg-prototype \
+  --settings ALLOWED_CALLER_POLICY="${appPrincipalId}=example-client"
+
+az functionapp restart --name GeneratemTLSv2 --resource-group rg-prototype
+```
+
+**d. Obtain a shell inside the App Service to run the real client-side test.**
+
+Blocker encountered: `PivotAppService` was still running Azure's default placeholder image (`mcr.microsoft.com/appsvc/staticsite:latest`, visible via `az webapp sitecontainers list`), which has no SSH server, so `az webapp ssh` failed with "SSH endpoint unreachable" regardless of app state. Fix: deploy a minimal custom container with `openssl`, `curl`, `python3`, and an SSH server, built for this purpose:
+
+```dockerfile
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y openssl curl openssh-server && \
+    mkdir /var/run/sshd && \
+    echo 'root:Docker!' | chpasswd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config
+EXPOSE 2222 80
+# App Service's readiness probe hits the main HTTP port (80) before SSH tunneling
+# is allowed through — sshd alone starting is not sufficient; a listener on 80
+# is also required, or az webapp ssh keeps reporting "app must be running"
+CMD service ssh start && python3 -m http.server 80
+```
+
+```bash
+docker build --platform linux/amd64 -t containerrestry-cgdqe7hee4hxe3ht.azurecr.io/appservice-test:latest .
+docker push containerrestry-cgdqe7hee4hxe3ht.azurecr.io/appservice-test:latest
+
+az webapp config container set \
+  --name PivotAppService --resource-group rg-prototype \
+  --docker-custom-image-name containerrestry-cgdqe7hee4hxe3ht.azurecr.io/appservice-test:latest \
+  --docker-registry-server-url https://containerrestry-cgdqe7hee4hxe3ht.azurecr.io
+
+az role assignment create \
+  --assignee-object-id $appPrincipalId \
+  --assignee-principal-type ServicePrincipal \
+  --role AcrPull \
+  --scope $(az acr show --name ContainerRestry --query id -o tsv)
+
+az webapp config set --name PivotAppService --resource-group rg-prototype \
+  --generic-configurations '{"acrUseManagedIdentityCreds": true}'
+```
+
+Second blocker encountered: `az webapp show` returned `State: QuotaExceeded`, and `az webapp log tail` failed with `403 Site Disabled`. Root cause: `PivotAppService` was still on its originally auto-provisioned **F1 (Free)** App Service Plan (`ASP-rgprototype-a3f0`), which has a tight daily CPU-minute quota and does not support custom Linux containers at all. Fix: move it onto the already-provisioned paid Linux B1 plan (`signing-function-plan`) rather than provision a new one, to avoid any additional subscription quota consumption:
+
+```bash
+planId=$(az appservice plan show --name signing-function-plan --resource-group rg-prototype --query id -o tsv)
+
+az webapp update \
+  --name PivotAppService --resource-group rg-prototype \
+  --set serverFarmId=$planId
+
+az webapp restart --name PivotAppService --resource-group rg-prototype
+```
+
+Once `state` shows `Running` and the container log confirms both `sshd` and the HTTP listener started:
+
+```bash
+az webapp ssh --name PivotAppService --resource-group rg-prototype
+```
+
+**e. Inside the App Service shell — generate CSR, fetch a real Managed Identity token, call the Function:**
+
+App Service Linux containers expose identity via `IDENTITY_ENDPOINT`/`IDENTITY_HEADER` environment variables (not the VM-style `169.254.169.254` metadata endpoint):
+
+```bash
+openssl req -new -newkey rsa:2048 -nodes \
+  -keyout client.key -out client.csr -subj "/CN=example-client"
+
+curl -s "$IDENTITY_ENDPOINT?resource=api://$appId&api-version=2019-08-01" \
+  -H "X-IDENTITY-HEADER: $IDENTITY_HEADER" -o token.json
+
+TOKEN=$(python3 -c "import json; print(json.load(open('token.json'))['access_token'])")
+
+curl -i -X POST "https://generatemtlsv2.azurewebsites.net/api/issue" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-binary @client.csr -o client.crt
+```
+
+**Status at time of writing:** infrastructure blockers (placeholder image, F1 quota) were resolved; the final in-shell managed-identity issuance call had not yet been executed/confirmed successful.
 
 ---
 
